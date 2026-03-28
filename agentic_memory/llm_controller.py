@@ -2,7 +2,7 @@ from typing import Dict, Optional, Literal, Any
 import os
 import json
 from abc import ABC, abstractmethod
-from litellm import completion
+import httpx
 
 class BaseLLMController(ABC):
     @abstractmethod
@@ -69,29 +69,93 @@ class OllamaController(BaseLLMController):
         return result
 
     def get_completion(self, prompt: str, response_format: dict, temperature: float = 0.7) -> str:
-        # Allow exceptions (like ConnectionError) to bubble up for better debugging
-        response = completion(
-            model="ollama_chat/{}".format(self.model),
-            messages=[
+        # Use HTTP to localhost:11434 (Ollama) instead of litellm library
+        resp = httpx.post(
+            "http://localhost:11434/v1/chat/completions",
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "You must respond with a JSON object."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": temperature,
+                "response_format": response_format,
+            },
+            timeout=120
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+class LiteLLMGatewayController(BaseLLMController):
+    """Controller for LiteLLM proxy gateway.
+
+    Uses the LiteLLM gateway at localhost:4000 for unified model access.
+    Model aliases:
+    - memory-evolution: Gemini Pro for memory evolution tasks
+    - metadata: Gemini Flash for fast metadata extraction
+    """
+
+    def __init__(
+        self,
+        model: str = "memory-evolution",
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None
+    ):
+        """Initialize LiteLLM gateway controller.
+
+        Args:
+            model: Model alias (memory-evolution, metadata) or full model name
+            base_url: LiteLLM gateway URL (default: http://localhost:4000)
+            api_key: API key for the gateway (if required)
+        """
+        self.model = model
+        self.base_url = base_url or os.getenv("LITELLM_GATEWAY_URL", "http://localhost:4000")
+        self.api_key = api_key or os.getenv("LITELLM_API_KEY", "")
+
+    def get_completion(self, prompt: str, response_format: dict = None, temperature: float = 0.7) -> str:
+        """Get completion from LiteLLM gateway via HTTP."""
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        payload = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": "You must respond with a JSON object."},
                 {"role": "user", "content": prompt}
             ],
-            response_format=response_format,
+            "temperature": temperature,
+            "max_tokens": 1000,
+        }
+
+        if response_format:
+            payload["response_format"] = response_format
+
+        resp = httpx.post(
+            f"{self.base_url}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=120
         )
-        return response.choices[0].message.content
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
 
 class LLMController:
     """LLM-based controller for memory metadata generation"""
-    def __init__(self, 
-                 backend: Literal["openai", "ollama"] = "openai",
-                 model: str = "gpt-4", 
-                 api_key: Optional[str] = None):
+    def __init__(self,
+                 backend: Literal["openai", "ollama", "litellm"] = "openai",
+                 model: str = "gpt-4",
+                 api_key: Optional[str] = None,
+                 base_url: Optional[str] = None):
         if backend == "openai":
             self.llm = OpenAIController(model, api_key)
         elif backend == "ollama":
             self.llm = OllamaController(model)
+        elif backend == "litellm":
+            self.llm = LiteLLMGatewayController(model, base_url, api_key)
         else:
-            raise ValueError("Backend must be one of: 'openai', 'ollama'")
+            raise ValueError("Backend must be one of: 'openai', 'ollama', 'litellm'")
             
     def get_completion(self, prompt: str, response_format: dict = None, temperature: float = 0.7) -> str:
         return self.llm.get_completion(prompt, response_format, temperature)

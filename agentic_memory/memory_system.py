@@ -3,7 +3,7 @@ from typing import List, Dict, Optional, Any, Tuple
 import uuid
 from datetime import datetime
 from .llm_controller import LLMController
-from .retrievers import ChromaRetriever
+from .retrievers import ChromaRetriever, PersistentChromaRetriever
 import json
 import logging
 from rank_bm25 import BM25Okapi
@@ -16,7 +16,6 @@ from transformers import AutoModel, AutoTokenizer
 from nltk.tokenize import word_tokenize
 import pickle
 from pathlib import Path
-from litellm import completion
 import time
 
 logger = logging.getLogger(__name__)
@@ -90,36 +89,72 @@ class AgenticMemorySystem:
     - Hybrid search capabilities
     """
     
-    def __init__(self, 
+    def __init__(self,
                  model_name: str = 'all-MiniLM-L6-v2',
                  llm_backend: str = "openai",
                  llm_model: str = "gpt-4o-mini",
                  evo_threshold: int = 100,
-                 api_key: Optional[str] = None):  
+                 api_key: Optional[str] = None,
+                 persistent: bool = True,
+                 persist_directory: Optional[str] = None,
+                 namespace: str = "default",
+                 llm_base_url: Optional[str] = None):
         """Initialize the memory system.
-        
+
         Args:
             model_name: Name of the sentence transformer model
-            llm_backend: LLM backend to use (openai/ollama)
+            llm_backend: LLM backend to use (openai/ollama/litellm)
             llm_model: Name of the LLM model
             evo_threshold: Number of memories before triggering evolution
             api_key: API key for the LLM service
+            persistent: If True, use persistent storage (default: True)
+            persist_directory: Directory for persistent storage (default: ~/.agentic_memory)
+            namespace: Namespace for multi-session isolation (used as collection name suffix)
+            llm_base_url: Base URL for LiteLLM gateway (when using litellm backend)
         """
         self.memories = {}
         self.model_name = model_name
-        # Initialize ChromaDB retriever with empty collection
-        try:
-            # First try to reset the collection if it exists
-            temp_retriever = ChromaRetriever(collection_name="memories",model_name=self.model_name)
-            temp_retriever.client.reset()
-        except Exception as e:
-            logger.warning(f"Could not reset ChromaDB collection: {e}")
-            
-        # Create a fresh retriever instance
-        self.retriever = ChromaRetriever(collection_name="memories",model_name=self.model_name)
-        
+        self.namespace = namespace
+        self.persistent = persistent
+
+        collection_name = f"memories_{namespace}" if namespace != "default" else "memories"
+
+        if persistent:
+            # Use persistent storage
+            if persist_directory is None:
+                persist_directory = os.path.expanduser("~/.agentic_memory")
+            self.persist_directory = persist_directory
+
+            try:
+                self.retriever = PersistentChromaRetriever(
+                    directory=persist_directory,
+                    collection_name=collection_name,
+                    model_name=self.model_name,
+                    extend=True  # Allow extending existing collections
+                )
+                logger.info(f"Initialized persistent memory at {persist_directory}")
+            except Exception as e:
+                logger.warning(f"Could not initialize persistent storage: {e}, falling back to ephemeral")
+                self.retriever = ChromaRetriever(collection_name=collection_name, model_name=self.model_name)
+                self.persistent = False
+        else:
+            # Use ephemeral storage
+            try:
+                # First try to reset the collection if it exists
+                temp_retriever = ChromaRetriever(collection_name=collection_name, model_name=self.model_name)
+                temp_retriever.client.reset()
+            except Exception as e:
+                logger.warning(f"Could not reset ChromaDB collection: {e}")
+
+            # Create a fresh retriever instance
+            self.retriever = ChromaRetriever(collection_name=collection_name, model_name=self.model_name)
+
+        # Restore in-memory metadata from ChromaDB on startup
+        if self.persistent:
+            self._restore_memories_from_chroma()
+
         # Initialize LLM controller
-        self.llm_controller = LLMController(llm_backend, llm_model, api_key)
+        self.llm_controller = LLMController(llm_backend, llm_model, api_key, llm_base_url)
         self.evo_cnt = 0
         self.evo_threshold = evo_threshold
 
@@ -156,6 +191,54 @@ class AgenticMemorySystem:
                                 }}
                                 '''
         
+    def _restore_memories_from_chroma(self):
+        """Restore in-memory metadata dict from persistent ChromaDB on startup."""
+        try:
+            collection = self.retriever.collection
+            count = collection.count()
+            if count == 0:
+                return
+
+            logger.info(f"Restoring {count} memories from persistent storage...")
+            batch_size = 1000
+            restored = 0
+            for offset in range(0, count, batch_size):
+                batch = collection.get(
+                    limit=batch_size,
+                    offset=offset,
+                    include=["metadatas"]
+                )
+                for id_, meta in zip(batch["ids"], batch["metadatas"]):
+                    try:
+                        # Parse JSON-encoded list/dict fields
+                        keywords = json.loads(meta.get("keywords", "[]")) if isinstance(meta.get("keywords"), str) else meta.get("keywords", [])
+                        links = json.loads(meta.get("links", "[]")) if isinstance(meta.get("links"), str) else meta.get("links", [])
+                        tags = json.loads(meta.get("tags", "[]")) if isinstance(meta.get("tags"), str) else meta.get("tags", [])
+                        evolution_history = json.loads(meta.get("evolution_history", "[]")) if isinstance(meta.get("evolution_history"), str) else meta.get("evolution_history", [])
+                        retrieval_count = int(meta.get("retrieval_count", 0))
+
+                        note = MemoryNote(
+                            content=meta.get("content", ""),
+                            id=id_,
+                            keywords=keywords,
+                            links=links,
+                            retrieval_count=retrieval_count,
+                            timestamp=meta.get("timestamp"),
+                            last_accessed=meta.get("last_accessed"),
+                            context=meta.get("context"),
+                            evolution_history=evolution_history,
+                            category=meta.get("category"),
+                            tags=tags,
+                        )
+                        self.memories[id_] = note
+                        restored += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to restore memory {id_}: {e}")
+
+            logger.info(f"Restored {restored}/{count} memories from persistent storage")
+        except Exception as e:
+            logger.warning(f"Could not restore memories from ChromaDB: {e}")
+
     def analyze_content(self, content: str) -> Dict:            
         """Analyze content using LLM to extract semantic metadata.
         
