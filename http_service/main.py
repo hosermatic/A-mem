@@ -166,16 +166,44 @@ async def health_check():
 
 @app.post("/memory/add", response_model=dict, tags=["Memory"])
 async def add_memory(request: AddMemoryRequest):
-    """Add a new memory to the system."""
+    """Add a new memory to the system with deduplication gate."""
     if not memory_system:
         raise HTTPException(status_code=503, detail="Memory system not initialized")
 
     try:
+        # ── Dedup gate: check nearest neighbor before storing ──────────────
+        action = "created"
+        existing_id = None
+        try:
+            neighbors = memory_system.search_agentic(request.content, k=1)
+            if neighbors:
+                top = neighbors[0]
+                score = top.get("score", 0.0) if isinstance(top, dict) else getattr(top, "score", 0.0)
+                top_id = top.get("id", "") if isinstance(top, dict) else getattr(top, "id", "")
+                if score >= 0.92:
+                    # Near-duplicate: skip storing, return existing ID
+                    logger.info(f"Dedup gate: score={score:.3f} → returning existing {top_id}")
+                    return {"id": top_id, "action": "existing", "status": "deduplicated", "score": score}
+                elif score >= 0.80:
+                    # Related: store new but link to existing
+                    action = "linked"
+                    existing_id = top_id
+        except Exception as dedup_err:
+            # Dedup failure is non-fatal — proceed with normal add
+            logger.warning(f"Dedup check failed (non-fatal): {dedup_err}")
+
         kwargs = {
             "tags": request.tags,
             "category": request.category,
             "timestamp": request.timestamp,
         }
+        # Link to related memory if found in 0.80–0.92 range
+        if existing_id and request.metadata is not None:
+            request.metadata["related_to"] = existing_id
+            kwargs["metadata"] = request.metadata
+        elif existing_id:
+            kwargs["metadata"] = {"related_to": existing_id}
+
         # Pass code context metadata if provided
         if request.file_path is not None:
             kwargs["file_path"] = request.file_path
@@ -187,7 +215,7 @@ async def add_memory(request: AddMemoryRequest):
             kwargs["line_range"] = request.line_range
         if request.language is not None:
             kwargs["language"] = request.language
-        if request.metadata is not None:
+        if request.metadata is not None and "metadata" not in kwargs:
             kwargs["metadata"] = request.metadata
 
         memory_id = memory_system.add_note(
@@ -199,8 +227,8 @@ async def add_memory(request: AddMemoryRequest):
             bm25_meta = {k: v for k, v in kwargs.items() if v is not None and k != "timestamp"}
             bm25_retriever.add_document(doc_id=memory_id, text=request.content, metadata=bm25_meta)
 
-        logger.info(f"Added memory with ID: {memory_id}")
-        return {"id": memory_id, "status": "created"}
+        logger.info(f"Added memory {memory_id} (action={action})")
+        return {"id": memory_id, "action": action, "status": "created"}
     except Exception as e:
         logger.error(f"Error adding memory: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -433,7 +461,7 @@ async def list_memories(limit: int = 100, offset: int = 0):
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", "8100"))
+    port = int(os.getenv("PORT", "8101"))
     host = os.getenv("HOST", "0.0.0.0")
 
     uvicorn.run(app, host=host, port=port)

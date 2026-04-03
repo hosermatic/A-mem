@@ -1,4 +1,6 @@
 import json
+import math
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional
 import ast
@@ -108,8 +110,53 @@ class ChromaRetriever:
         
         return results
 
+    def search_filtered(
+        self,
+        query: str,
+        k: int = 5,
+        where: Optional[Dict] = None,
+    ) -> List[Dict]:
+        """Search with optional ChromaDB metadata filtering.
+
+        Args:
+            query: Query text
+            k: Number of results to return
+            where: ChromaDB where clause dict (e.g. {"class_name": "Foo"})
+
+        Returns:
+            List of dicts with document, metadata, id, and distance
+        """
+        kwargs = {"query_texts": [query], "n_results": k}
+        if where:
+            kwargs["where"] = where
+
+        results = self.collection.query(**kwargs)
+
+        if (results is not None) and (results.get("metadatas", [])):
+            results["metadatas"] = self._convert_metadata_types(
+                results["metadatas"])
+
+        # Flatten into list of dicts for API consumption
+        output = []
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+        ids = results.get("ids", [[]])[0]
+        dists = results.get("distances", [[]])[0]
+
+        for i in range(len(docs)):
+            entry = {
+                "id": ids[i] if i < len(ids) else None,
+                "document": docs[i] if i < len(docs) else None,
+                "distance": dists[i] if i < len(dists) else None,
+            }
+            if i < len(metas):
+                entry.update(metas[i])
+            output.append(entry)
+
+        return output
+
     def _convert_metadata_types(
-        self, 
+        self,
         metadatas: List[List[Dict]]
     ) -> List[List[Dict]]:
         """Convert string metadata back to original types.
@@ -142,6 +189,78 @@ class ChromaRetriever:
                     metadata[key] = ast.literal_eval(value)
                 except Exception:
                     pass
+
+
+class BM25Retriever:
+    """Simple BM25 (Okapi) term-frequency search over in-memory documents.
+
+    Complements vector search with keyword matching — useful for exact term
+    lookups (codec names, function signatures, error messages) that embedding
+    models may miss.
+    """
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self.docs: List[Dict] = []  # [{id, text, metadata}]
+        self.doc_freqs: Counter = Counter()  # term -> number of docs containing it
+        self.doc_lens: List[int] = []
+        self.avg_dl: float = 0.0
+        self.N: int = 0
+
+    def add_document(self, doc_id: str, text: str, metadata: Optional[Dict] = None):
+        """Index a document for BM25 search."""
+        tokens = simple_tokenize(text.lower())
+        self.docs.append({"id": doc_id, "text": text, "metadata": metadata or {}, "tokens": tokens})
+        self.doc_lens.append(len(tokens))
+        self.N += 1
+        self.avg_dl = sum(self.doc_lens) / self.N if self.N else 0.0
+        # Update document frequencies
+        unique_terms = set(tokens)
+        for term in unique_terms:
+            self.doc_freqs[term] += 1
+
+    def search(self, query: str, k: int = 5) -> List[Dict]:
+        """BM25 search returning top-k results sorted by score."""
+        query_tokens = simple_tokenize(query.lower())
+        scores = []
+
+        for idx, doc in enumerate(self.docs):
+            score = self._score_document(query_tokens, doc["tokens"], self.doc_lens[idx])
+            if score > 0:
+                scores.append((idx, score))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        results = []
+        for idx, score in scores[:k]:
+            doc = self.docs[idx]
+            entry = {
+                "id": doc["id"],
+                "document": doc["text"],
+                "bm25_score": round(score, 4),
+            }
+            entry.update(doc["metadata"])
+            results.append(entry)
+        return results
+
+    def _score_document(self, query_tokens: List[str], doc_tokens: List[str], dl: int) -> float:
+        """Compute BM25 score for a single document."""
+        tf_doc = Counter(doc_tokens)
+        score = 0.0
+        for term in query_tokens:
+            if term not in tf_doc:
+                continue
+            tf = tf_doc[term]
+            df = self.doc_freqs.get(term, 0)
+            idf = math.log((self.N - df + 0.5) / (df + 0.5) + 1.0)
+            numerator = tf * (self.k1 + 1)
+            denominator = tf + self.k1 * (1 - self.b + self.b * dl / self.avg_dl) if self.avg_dl > 0 else tf + self.k1
+            score += idf * (numerator / denominator)
+        return score
+
+    @property
+    def count(self) -> int:
+        return self.N
 
 
 class PersistentChromaRetriever(ChromaRetriever):
