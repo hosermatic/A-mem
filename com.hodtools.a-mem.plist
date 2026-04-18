@@ -18,6 +18,10 @@
     <dict>
         <key>PORT</key>
         <string>8101</string>
+        <key>LITELLM_GATEWAY_URL</key>
+        <string>http://localhost:8190</string>
+        <key>LLM_MODEL</key>
+        <string>memory-evolution</string>
     </dict>
 
     <key>KeepAlive</key>

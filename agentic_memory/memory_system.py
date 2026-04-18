@@ -3,9 +3,11 @@ from typing import List, Dict, Optional, Any, Tuple
 import uuid
 from datetime import datetime
 from .llm_controller import LLMController
-from .retrievers import ChromaRetriever, PersistentChromaRetriever
+from .retrievers import ChromaRetriever, PersistentChromaRetriever, BM25Retriever
 import json
 import logging
+import re as _re
+import math as _math
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 import numpy as np
@@ -79,6 +81,54 @@ class MemoryNote:
         self.retrieval_count = retrieval_count or 0
         self.evolution_history = evolution_history or []
 
+def _infer_category(content: str) -> str:
+    c = content.lower()
+    if any(w in c for w in ("lesson", "bug", "error", "failed", "fixed", "incident")):
+        return "lesson"
+    if any(w in c for w in ("checkpoint", "session", "branch", "commit")):
+        return "checkpoint"
+    if any(w in c for w in ("plan", "phase", "task", "roadmap")):
+        return "plan"
+    if any(w in c for w in ("always", "never", "prefer", "avoid", "rule", "standard")):
+        return "behavioral-rule"
+    if any(w in c for w in ("port", "url", "path", "config", "key-facts", "api key")):
+        return "key-facts"
+    if any(w in c for w in ("next session", "resume", "continuation")):
+        return "session-handoff"
+    return "general"
+
+
+def _extract_keywords(content: str) -> list:
+    tokens = _re.findall(
+        r'\b[A-Z][A-Za-z]{2,}\b'
+        r'|[a-z]+-[a-z]+'
+        r'|\b[A-Z_]{3,}\b'
+        r'|\bPR\s*#\d+\b'
+        r'|\bv\d+\.\d+\b',
+        content,
+    )
+    seen = set()
+    result = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            result.append(t)
+        if len(result) >= 10:
+            break
+    return result
+
+
+def _recency_score(timestamp_str: str, half_life_hours: float = 48.0) -> float:
+    """Exponential decay: 1.0 = now, 0.5 = one half-life ago. Returns 0.1 min."""
+    try:
+        from datetime import datetime as _dt
+        ts = _dt.strptime(timestamp_str, "%Y%m%d%H%M")
+        hours_old = (_dt.now() - ts).total_seconds() / 3600
+        return max(0.1, _math.exp(-0.693 * hours_old / half_life_hours))
+    except Exception:
+        return 0.5
+
+
 class AgenticMemorySystem:
     """Core memory system that manages memory notes and their evolution.
     
@@ -148,6 +198,9 @@ class AgenticMemorySystem:
 
             # Create a fresh retriever instance
             self.retriever = ChromaRetriever(collection_name=collection_name, model_name=self.model_name)
+
+        # BM25 index — must be initialized before _restore_memories_from_chroma()
+        self._bm25: BM25Retriever = BM25Retriever()
 
         # Restore in-memory metadata from ChromaDB on startup
         if self.persistent:
@@ -236,6 +289,12 @@ class AgenticMemorySystem:
                         logger.warning(f"Failed to restore memory {id_}: {e}")
 
             logger.info(f"Restored {restored}/{count} memories from persistent storage")
+
+            # Rebuild BM25 index from loaded memories
+            self._bm25 = BM25Retriever()
+            for mem_id, mem in self.memories.items():
+                self._bm25.add_document(mem_id, mem.content, {})
+            logger.info(f"BM25 index rebuilt: {self._bm25.count} documents")
         except Exception as e:
             logger.warning(f"Could not restore memories from ChromaDB: {e}")
 
@@ -339,7 +398,8 @@ class AgenticMemorySystem:
             "tags": note.tags
         }
         self.retriever.add_document(note.content, metadata, note.id)
-        
+        self._bm25.add_document(note.id, note.content, {})
+
         if evo_label == True:
             self.evo_cnt += 1
             if self.evo_cnt % self.evo_threshold == 0:
@@ -347,11 +407,30 @@ class AgenticMemorySystem:
         return note.id
     
     def consolidate_memories(self):
-        """Consolidate memories: update retriever with new documents"""
-        # Reset ChromaDB collection
-        self.retriever = ChromaRetriever(collection_name="memories",model_name=self.model_name)
-        
-        # Re-add all memory documents with their complete metadata
+        """Rebuild retriever from self.memories.
+
+        Uses PersistentChromaRetriever when persistent=True so data survives
+        service restarts. Respects self.namespace for collection naming.
+        Also rebuilds the BM25 index.
+        """
+        collection_name = f"memories_{self.namespace}" if self.namespace != "default" else "memories"
+
+        if self.persistent:
+            self.retriever = PersistentChromaRetriever(
+                directory=self.persist_directory,
+                collection_name=collection_name,
+                model_name=self.model_name,
+                extend=False,
+            )
+        else:
+            self.retriever = ChromaRetriever(
+                collection_name=collection_name,
+                model_name=self.model_name,
+            )
+
+        # Rebuild BM25 index
+        self._bm25 = BM25Retriever()
+
         for memory in self.memories.values():
             metadata = {
                 "id": memory.id,
@@ -364,10 +443,38 @@ class AgenticMemorySystem:
                 "context": memory.context,
                 "evolution_history": memory.evolution_history,
                 "category": memory.category,
-                "tags": memory.tags
+                "tags": memory.tags,
             }
             self.retriever.add_document(memory.content, metadata, memory.id)
+            self._bm25.add_document(memory.id, memory.content, {})
     
+    def _sync_memory_to_chroma(self, memory_id: str) -> None:
+        """Write a single memory from self.memories back to ChromaDB.
+
+        Called after process_memory modifies a neighbor's metadata in-place.
+        """
+        mem = self.memories.get(memory_id)
+        if not mem:
+            return
+        metadata = {
+            "id": mem.id,
+            "content": mem.content,
+            "keywords": mem.keywords,
+            "links": mem.links,
+            "retrieval_count": mem.retrieval_count,
+            "timestamp": mem.timestamp,
+            "last_accessed": mem.last_accessed,
+            "context": mem.context,
+            "evolution_history": mem.evolution_history,
+            "category": mem.category,
+            "tags": mem.tags,
+        }
+        try:
+            self.retriever.delete_document(memory_id)
+        except Exception:
+            pass
+        self.retriever.add_document(mem.content, metadata, memory_id)
+
     def find_related_memories(self, query: str, k: int = 5) -> Tuple[str, List[int]]:
         """Find related memories using ChromaDB retrieval"""
         if not self.memories:
@@ -590,64 +697,78 @@ class AgenticMemorySystem:
         return memories[:k]
 
     def search_agentic(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for memories using ChromaDB retrieval."""
+        """Search using hybrid BM25+vector scoring with recency decay."""
         if not self.memories:
             return []
-            
+
         try:
-            # Get results from ChromaDB
-            results = self.retriever.search(query, k)
-            
-            # Process results
-            memories = []
-            seen_ids = set()
-            
-            # Check if we have valid results
-            if ('ids' not in results or not results['ids'] or 
-                len(results['ids']) == 0 or len(results['ids'][0]) == 0):
+            fetch_k = max(k * 3, 20)
+
+            # Vector scores (ChromaDB cosine distance → similarity)
+            chroma = self.retriever.search(query, fetch_k)
+            if ('ids' not in chroma or not chroma['ids'] or
+                    len(chroma['ids']) == 0 or len(chroma['ids'][0]) == 0):
                 return []
-                
-            # Process ChromaDB results
-            for i, doc_id in enumerate(results['ids'][0][:k]):
+
+            vector_scores: Dict[str, float] = {}
+            for i, doc_id in enumerate(chroma['ids'][0]):
+                dist = chroma['distances'][0][i] if 'distances' in chroma else 1.0
+                vector_scores[doc_id] = max(0.0, 1.0 - dist)
+
+            # BM25 scores (normalized 0–1)
+            bm25_raw = self._bm25.search(query, fetch_k)
+            bm25_scores: Dict[str, float] = {}
+            if bm25_raw:
+                max_bm25 = max(r['bm25_score'] for r in bm25_raw)
+                if max_bm25 > 0:
+                    for r in bm25_raw:
+                        bm25_scores[r['id']] = r['bm25_score'] / max_bm25
+
+            # Hybrid + recency
+            all_ids = set(vector_scores) | set(bm25_scores)
+            scored: List[tuple] = []
+            for doc_id in all_ids:
+                v_score = vector_scores.get(doc_id, 0.0)
+                b_score = bm25_scores.get(doc_id, 0.0)
+                base = v_score * 0.6 + b_score * 0.4
+
+                mem = self.memories.get(doc_id)
+                recency = _recency_score(mem.timestamp if mem else "") if mem else 0.5
+                final = base * 0.80 + recency * 0.20
+
+                scored.append((doc_id, final))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+
+            # Build result dicts
+            memories: List[Dict[str, Any]] = []
+            seen_ids: set = set()
+            for doc_id, score in scored[:k]:
                 if doc_id in seen_ids:
                     continue
-                    
-                if i < len(results['metadatas'][0]):
-                    metadata = results['metadatas'][0][i]
-                    
-                    # Create result dictionary with all metadata fields
-                    memory_dict = {
-                        'id': doc_id,
-                        'content': metadata.get('content', ''),
-                        'context': metadata.get('context', ''),
-                        'keywords': metadata.get('keywords', []),
-                        'tags': metadata.get('tags', []),
-                        'timestamp': metadata.get('timestamp', ''),
-                        'category': metadata.get('category', 'Uncategorized'),
-                        'is_neighbor': False
-                    }
-                    
-                    # Add score if available
-                    if 'distances' in results and len(results['distances']) > 0 and i < len(results['distances'][0]):
-                        memory_dict['score'] = results['distances'][0][i]
-                        
-                    memories.append(memory_dict)
-                    seen_ids.add(doc_id)
-            
-            # Add linked memories (neighbors)
+                mem = self.memories.get(doc_id)
+                if not mem:
+                    continue
+                memories.append({
+                    'id': doc_id,
+                    'content': mem.content,
+                    'context': mem.context,
+                    'keywords': mem.keywords,
+                    'tags': mem.tags,
+                    'timestamp': mem.timestamp,
+                    'category': mem.category,
+                    'score': round(1.0 - score, 4),
+                    'is_neighbor': False,
+                })
+                seen_ids.add(doc_id)
+
+            # Add linked neighbors (up to k total)
             neighbor_count = 0
-            for memory in list(memories):  # Use a copy to avoid modification during iteration
+            for memory in list(memories):
                 if neighbor_count >= k:
                     break
-                    
-                # Get links from metadata
-                links = memory.get('links', [])
-                if not links and 'id' in memory:
-                    # Try to get links from memory object
-                    mem_obj = self.memories.get(memory['id'])
-                    if mem_obj:
-                        links = mem_obj.links
-                        
+                mem = self.memories.get(memory['id'])
+                links = mem.links if mem else []
                 for link_id in links:
                     if link_id not in seen_ids and neighbor_count < k:
                         neighbor = self.memories.get(link_id)
@@ -660,12 +781,13 @@ class AgenticMemorySystem:
                                 'tags': neighbor.tags,
                                 'timestamp': neighbor.timestamp,
                                 'category': neighbor.category,
-                                'is_neighbor': True
+                                'is_neighbor': True,
                             })
                             seen_ids.add(link_id)
                             neighbor_count += 1
-            
+
             return memories[:k]
+
         except Exception as e:
             logger.error(f"Error in search_agentic: {str(e)}")
             return []
@@ -679,7 +801,13 @@ class AgenticMemorySystem:
         Returns:
             Tuple[bool, MemoryNote]: (should_evolve, processed_note)
         """
-        # For first memory or testing, just return the note without evolution
+        # Apply rule-based fallback regardless of whether LLM evolution runs
+        if note.category in (None, "", "Uncategorized"):
+            note.category = _infer_category(note.content)
+        if not note.keywords:
+            note.keywords = _extract_keywords(note.content)
+
+        # For first memory, skip neighbor-based LLM evolution
         if not self.memories:
             return False, note
             
@@ -797,14 +925,28 @@ class AgenticMemorySystem:
                                         # Make sure the index is valid
                                         if memorytmp_idx < len(notes_id):
                                             self.memories[notes_id[memorytmp_idx]] = notetmp
-                                
+                                            self._sync_memory_to_chroma(notes_id[memorytmp_idx])
+
                 return should_evolve, note
-                
+
             except (json.JSONDecodeError, KeyError, Exception) as e:
-                logger.error(f"Error in memory evolution: {str(e)}")
+                logger.warning(
+                    f"Memory evolution LLM call failed ({type(e).__name__}): {e}. "
+                    "Using rule-based fallback."
+                )
+                if note.category in (None, "", "Uncategorized"):
+                    note.category = _infer_category(note.content)
+                if not note.keywords:
+                    note.keywords = _extract_keywords(note.content)
                 return False, note
-                
+
         except Exception as e:
-            # For testing purposes, catch all exceptions and return the original note
-            logger.error(f"Error in process_memory: {str(e)}")
+            logger.warning(
+                f"Memory evolution LLM call failed ({type(e).__name__}): {e}. "
+                "Using rule-based fallback."
+            )
+            if note.category in (None, "", "Uncategorized"):
+                note.category = _infer_category(note.content)
+            if not note.keywords:
+                note.keywords = _extract_keywords(note.content)
             return False, note
