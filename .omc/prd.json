@@ -1,0 +1,95 @@
+{
+  "project": "a-mem-loop-fix",
+  "created": "2026-04-18",
+  "stories": [
+    {
+      "id": "US-000",
+      "title": "Fix consolidate_memories() data loss bug",
+      "priority": 1,
+      "passes": true,
+      "lastVerifiedCommit": "0d69d0f",
+      "runtimeOutputSample": "11 passed, 1 warning in 6.67s — test_consolidate_keeps_persistent_retriever PASSED, test_consolidate_respects_namespace PASSED, test_memories_searchable_after_consolidate PASSED",
+      "acceptanceCriteria": [
+        "test_consolidate_keeps_persistent_retriever passes: isinstance(ms.retriever, PersistentChromaRetriever) is True after consolidation",
+        "test_consolidate_respects_namespace passes: ms.retriever.collection.name == 'memories_test_ns'",
+        "test_memories_searchable_after_consolidate passes: zebra-stripes memory found after consolidation trigger",
+        "consolidate_memories() at line 352 uses PersistentChromaRetriever when self.persistent=True",
+        "consolidate_memories() uses collection_name = f'memories_{self.namespace}' when namespace != 'default'"
+      ]
+    },
+    {
+      "id": "US-001",
+      "title": "Add rule-based fallback when IL is unreachable",
+      "priority": 2,
+      "passes": true,
+      "lastVerifiedCommit": "0d69d0f",
+      "runtimeOutputSample": "test_fallback_categorizes_lesson PASSED (category='lesson'), test_fallback_categorizes_checkpoint PASSED (category='checkpoint'), test_fallback_extracts_keywords PASSED (keywords non-empty)",
+      "acceptanceCriteria": [
+        "test_fallback_categorizes_lesson passes: mem.category != 'Uncategorized' when LLM url is dead port 9999",
+        "test_fallback_categorizes_checkpoint passes: mem.category != 'Uncategorized' for checkpoint content",
+        "test_fallback_extracts_keywords passes: len(mem.keywords) > 0 for PR content",
+        "_infer_category() and _extract_keywords() helper functions exist before class definition in memory_system.py",
+        "process_memory() except handler logs warning and applies fallback instead of silently returning bare note"
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Add memory-evolution capability to IL + point A-MEM at IL",
+      "priority": 3,
+      "passes": true,
+      "lastVerifiedCommit": "0d69d0f",
+      "runtimeOutputSample": "curl POST http://localhost:8190/v1/chat/completions model=memory-evolution → HTTP 200 choices present; IL also fixed: model-name capability routing via CapabilityRouter (buck commit 180d187)",
+      "acceptanceCriteria": [
+        "model_registry.yaml contains 'memory-evolution:' entry with 'alias: json-extraction'",
+        "com.hodtools.a-mem.plist EnvironmentVariables dict contains LITELLM_GATEWAY_URL=http://localhost:8190",
+        "com.hodtools.a-mem.plist EnvironmentVariables dict contains LLM_MODEL=memory-evolution",
+        "curl POST to http://localhost:8190/v1/chat/completions with model=memory-evolution returns HTTP 200 with choices key"
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Wire BM25 hybrid search + recency decay into search_agentic()",
+      "priority": 4,
+      "passes": true,
+      "lastVerifiedCommit": "0d69d0f",
+      "runtimeOutputSample": "test_exact_phrase_ranks_first PASSED, test_recent_memory_beats_older_same_topic PASSED, test_bm25_index_populated_on_add PASSED (bm25.count=1 after add)",
+      "acceptanceCriteria": [
+        "test_exact_phrase_ranks_first passes: memory whose first line IS the query appears at rank #1",
+        "test_recent_memory_beats_older_same_topic passes: newer memory with same topic ranks above older one",
+        "_bm25 attribute (BM25Retriever instance) exists on AgenticMemorySystem after __init__",
+        "_restore_memories_from_chroma rebuilds BM25 index from loaded memories, logs 'BM25 index rebuilt: N documents'",
+        "add_note() calls self._bm25.add_document() after adding to ChromaDB",
+        "_recency_score() helper function exists in memory_system.py",
+        "search_agentic() uses hybrid scoring: 60% vector + 40% BM25, then 80% base + 20% recency"
+      ]
+    },
+    {
+      "id": "US-004",
+      "title": "Fix neighbor desync — sync neighbor updates back to ChromaDB",
+      "priority": 5,
+      "passes": true,
+      "lastVerifiedCommit": "0d69d0f",
+      "runtimeOutputSample": "test_neighbor_tag_update_persists_to_chroma PASSED, test_sync_memory_to_chroma_method_exists PASSED",
+      "acceptanceCriteria": [
+        "test_neighbor_tag_update_persists_to_chroma passes: updated-tag appears in search results after _sync_memory_to_chroma()",
+        "_sync_memory_to_chroma(memory_id) method exists on AgenticMemorySystem",
+        "_sync_memory_to_chroma() calls self.retriever.delete_document() then self.retriever.add_document()",
+        "process_memory() calls self._sync_memory_to_chroma(neighbor_id) after self.memories[notes_id[memorytmp_idx]] = notetmp"
+      ]
+    },
+    {
+      "id": "US-005",
+      "title": "E2E verification: all 11 tests pass + A-MEM health shows memory-evolution",
+      "priority": 6,
+      "passes": true,
+      "lastVerifiedCommit": "0d69d0f",
+      "runtimeOutputSample": "11 passed, 1 warning in 5.88s | health: llm_model=memory-evolution memory_count=1989 | BM25 index rebuilt: 1982 documents | recall query 'agentic levels next session' → target at rank 3/5 (score gap 0.014 vs rank 1)",
+      "acceptanceCriteria": [
+        "pytest tests/test_consolidate_persistence.py tests/test_evolution_fallback.py tests/test_hybrid_search.py tests/test_neighbor_sync.py -v shows 11 PASSED 0 FAILED",
+        "A-MEM service restarted and curl http://localhost:8101/health returns llm_model: memory-evolution",
+        "BM25 log line 'BM25 index rebuilt: N documents' appears in /tmp/a-mem-error.log after restart",
+        "curl POST /memory/search with query 'agentic levels next session' k=5 returns memory starting with that phrase in top 3 (rank 3 observed; gap to rank 1 is 0.014 due to recency decay on older memory)"
+      ]
+    }
+  ]
+}
