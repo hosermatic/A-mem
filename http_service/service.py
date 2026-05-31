@@ -69,7 +69,9 @@ async def lifespan(app: FastAPI):
             llm_backend=LLM_BACKEND,
             llm_model=LLM_MODEL,
             evo_threshold=EVO_THRESHOLD,
-            api_key=OPENAI_API_KEY or LITELLM_API_KEY,
+            # LiteLLM gateway needs its master key, not the OpenAI key. Prefer
+            # LITELLM_API_KEY so the gateway bearer is correct (matches main.py).
+            api_key=LITELLM_API_KEY or OPENAI_API_KEY,
             persistent=PERSISTENT,
             persist_directory=PERSIST_DIRECTORY,
             namespace=NAMESPACE,
