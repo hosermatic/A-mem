@@ -121,7 +121,7 @@ async def lifespan(app: FastAPI):
             model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
             llm_backend=llm_backend,
             llm_model=os.getenv("LLM_MODEL", "memory-evolution"),
-            llm_base_url=os.getenv("LITELLM_GATEWAY_URL", "http://localhost:4000") if llm_backend == "litellm" else None,
+            llm_base_url=os.getenv("LITELLM_GATEWAY_URL", "http://localhost:4001") if llm_backend == "litellm" else None,
             api_key=os.getenv("LITELLM_API_KEY") or os.getenv("OPENAI_API_KEY"),
         )
 

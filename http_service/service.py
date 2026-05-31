@@ -45,8 +45,8 @@ PERSIST_DIRECTORY = os.getenv("PERSIST_DIRECTORY", os.path.expanduser("~/.agenti
 NAMESPACE = os.getenv("MEMORY_NAMESPACE", "default")
 
 # LiteLLM Gateway settings
-LITELLM_GATEWAY_URL = os.getenv("LITELLM_GATEWAY_URL", "http://localhost:4000")
-LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "")
+LITELLM_GATEWAY_URL = os.getenv("LITELLM_GATEWAY_URL", "http://localhost:4001")
+LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "sk-master-key")
 
 
 @asynccontextmanager
