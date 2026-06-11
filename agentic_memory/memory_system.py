@@ -820,6 +820,7 @@ class AgenticMemorySystem:
             # Format neighbors for LLM - in this case, neighbors_text is already formatted
             
             # Query LLM for evolution decision
+            response = ""
             prompt = self._evolution_system_prompt.format(
                 content=note.content,
                 context=note.context,
@@ -881,7 +882,15 @@ class AgenticMemorySystem:
                     }}
                 )
                 
-                response_json = json.loads(response)
+                # Some models wrap JSON in markdown code fences despite the
+                # json_schema response_format — strip them before parsing.
+                cleaned = (response or "").strip()
+                if cleaned.startswith("```"):
+                    first_nl = cleaned.find("\n")
+                    closing = cleaned.rfind("```")
+                    if first_nl != -1 and closing > first_nl:
+                        cleaned = cleaned[first_nl + 1 : closing].strip()
+                response_json = json.loads(cleaned)
                 should_evolve = response_json["should_evolve"]
                 
                 if should_evolve:
@@ -932,6 +941,7 @@ class AgenticMemorySystem:
             except (json.JSONDecodeError, KeyError, Exception) as e:
                 logger.warning(
                     f"Memory evolution LLM call failed ({type(e).__name__}): {e}. "
+                    f"Raw response head: {(response or '')[:200]!r}. "
                     "Using rule-based fallback."
                 )
                 if note.category in (None, "", "Uncategorized"):

@@ -125,7 +125,10 @@ class LiteLLMGatewayController(BaseLLMController):
                 {"role": "user", "content": prompt}
             ],
             "temperature": temperature,
-            "max_tokens": 1000,
+            # Reasoning models (gemini-2.5-flash) spend thinking tokens inside
+            # max_tokens (observed ~600+ per evolution call), so 1000 truncated
+            # the JSON mid-output on real prompts and every parse failed.
+            "max_tokens": 4000,
         }
 
         if response_format:
