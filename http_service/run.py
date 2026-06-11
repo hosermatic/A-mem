@@ -31,8 +31,11 @@ def main():
     print(f"OpenAPI docs: http://localhost:{port}/docs")
     print(f"Health check: http://localhost:{port}/health")
 
+    # main:app (not service:app): adds the 0.92 dedup gate on add, BM25 index
+    # sync, /memory/search/{bm25,hybrid,filtered}, and a GET /memory legacy
+    # alias. service.py is the pre-dedup app kept for reference.
     uvicorn.run(
-        "http_service.service:app",
+        "http_service.main:app",
         host=host,
         port=port,
         reload=reload,

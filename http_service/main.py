@@ -8,7 +8,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -30,26 +30,26 @@ class AddMemoryRequest(BaseModel):
     """Request body for adding a memory."""
 
     content: str = Field(..., description="The content to store")
-    tags: list[str] | None = Field(default=None, description="Optional tags")
-    category: str | None = Field(default=None, description="Optional category")
-    timestamp: str | None = Field(
+    tags: Optional[list[str]] = Field(default=None, description="Optional tags")
+    category: Optional[str] = Field(default=None, description="Optional category")
+    timestamp: Optional[str] = Field(
         default=None, description="Optional timestamp (YYYYMMDDHHmm format)"
     )
     # Code context metadata for RAG enrichment
-    file_path: str | None = Field(default=None, description="Source file path")
-    class_name: str | None = Field(default=None, description="Containing class/struct/protocol")
-    function_name: str | None = Field(default=None, description="Containing function")
-    line_range: str | None = Field(default=None, description="Line range (e.g., '100-150')")
-    language: str | None = Field(default=None, description="Programming language")
-    metadata: dict | None = Field(default=None, description="Arbitrary key-value metadata")
+    file_path: Optional[str] = Field(default=None, description="Source file path")
+    class_name: Optional[str] = Field(default=None, description="Containing class/struct/protocol")
+    function_name: Optional[str] = Field(default=None, description="Containing function")
+    line_range: Optional[str] = Field(default=None, description="Line range (e.g., '100-150')")
+    language: Optional[str] = Field(default=None, description="Programming language")
+    metadata: Optional[dict] = Field(default=None, description="Arbitrary key-value metadata")
 
 
 class UpdateMemoryRequest(BaseModel):
     """Request body for updating a memory."""
 
-    content: str | None = Field(default=None, description="New content")
-    tags: list[str] | None = Field(default=None, description="New tags")
-    category: str | None = Field(default=None, description="New category")
+    content: Optional[str] = Field(default=None, description="New content")
+    tags: Optional[list[str]] = Field(default=None, description="New tags")
+    category: Optional[str] = Field(default=None, description="New category")
 
 
 class SearchRequest(BaseModel):
@@ -64,10 +64,10 @@ class FilteredSearchRequest(BaseModel):
 
     query: str = Field(..., description="Search query")
     k: int = Field(default=5, description="Number of results to return")
-    file_path: str | None = Field(default=None, description="Filter by file path (substring match)")
-    class_name: str | None = Field(default=None, description="Filter by exact class name")
-    language: str | None = Field(default=None, description="Filter by programming language")
-    category: str | None = Field(default=None, description="Filter by category")
+    file_path: Optional[str] = Field(default=None, description="Filter by file path (substring match)")
+    class_name: Optional[str] = Field(default=None, description="Filter by exact class name")
+    language: Optional[str] = Field(default=None, description="Filter by programming language")
+    category: Optional[str] = Field(default=None, description="Filter by category")
 
 
 class MemoryResponse(BaseModel):
@@ -75,17 +75,17 @@ class MemoryResponse(BaseModel):
 
     id: str
     content: str
-    tags: list[str] | None = None
-    context: str | None = None
-    keywords: list[str] | None = None
-    category: str | None = None
-    timestamp: str | None = None
-    file_path: str | None = None
-    class_name: str | None = None
-    function_name: str | None = None
-    line_range: str | None = None
-    language: str | None = None
-    metadata: dict | None = None
+    tags: Optional[list[str]] = None
+    context: Optional[str] = None
+    keywords: Optional[list[str]] = None
+    category: Optional[str] = None
+    timestamp: Optional[str] = None
+    file_path: Optional[str] = None
+    class_name: Optional[str] = None
+    function_name: Optional[str] = None
+    line_range: Optional[str] = None
+    language: Optional[str] = None
+    metadata: Optional[dict] = None
 
 
 class SearchResultResponse(BaseModel):
@@ -101,9 +101,9 @@ class HealthResponse(BaseModel):
 
     status: str
     timestamp: str
-    memory_count: int | None = None
-    model_name: str | None = None
-    llm_backend: str | None = None
+    memory_count: Optional[int] = None
+    model_name: Optional[str] = None
+    llm_backend: Optional[str] = None
 
 
 @asynccontextmanager
@@ -178,13 +178,17 @@ async def add_memory(request: AddMemoryRequest):
             neighbors = memory_system.search_agentic(request.content, k=1)
             if neighbors:
                 top = neighbors[0]
-                score = top.get("score", 0.0) if isinstance(top, dict) else getattr(top, "score", 0.0)
+                raw = top.get("score") if isinstance(top, dict) else getattr(top, "score", None)
                 top_id = top.get("id", "") if isinstance(top, dict) else getattr(top, "id", "")
-                if score >= 0.92:
+                # search_agentic reports an INVERTED relevance — round(1.0 - hybrid, 4),
+                # so 0.0 means an identical match. Convert back to similarity here.
+                # A missing/non-numeric score means "no information": never dedup on it.
+                similarity = (1.0 - raw) if isinstance(raw, (int, float)) else 0.0
+                if similarity >= 0.92:
                     # Near-duplicate: skip storing, return existing ID
-                    logger.info(f"Dedup gate: score={score:.3f} → returning existing {top_id}")
-                    return {"id": top_id, "action": "existing", "status": "deduplicated", "score": score}
-                elif score >= 0.80:
+                    logger.info(f"Dedup gate: similarity={similarity:.3f} → returning existing {top_id}")
+                    return {"id": top_id, "action": "existing", "status": "deduplicated", "score": round(similarity, 4)}
+                elif similarity >= 0.80:
                     # Related: store new but link to existing
                     action = "linked"
                     existing_id = top_id
@@ -456,6 +460,41 @@ async def list_memories(limit: int = 100, offset: int = 0):
     except Exception as e:
         logger.error(f"Error listing memories: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/memory", tags=["Memory"])
+async def list_memories_compat(limit: int = 100, offset: int = 0):
+    """List memories with pagination — service.py-compatible shape.
+
+    Shell consumers (amem-cleanup.sh weekly hygiene job) call GET /memory?limit=N
+    and expect {memories: [{id, content, ...}], total, limit, offset}. Keep this
+    alias byte-compatible with the legacy service.py response.
+    """
+    if not memory_system:
+        raise HTTPException(status_code=503, detail="Memory system not initialized")
+
+    memory_ids = list(memory_system.memories.keys())
+    total = len(memory_ids)
+    memories = []
+    for mid in memory_ids[offset : offset + limit]:
+        note = memory_system.memories.get(mid)
+        if not note:
+            continue
+        memories.append(
+            {
+                "id": note.id,
+                "content": note.content,
+                "keywords": note.keywords,
+                "context": note.context,
+                "category": note.category,
+                "tags": note.tags,
+                "timestamp": note.timestamp,
+                "last_accessed": note.last_accessed,
+                "retrieval_count": note.retrieval_count,
+                "links": note.links if isinstance(note.links, list) else [],
+            }
+        )
+    return {"memories": memories, "total": total, "limit": limit, "offset": offset}
 
 
 if __name__ == "__main__":
