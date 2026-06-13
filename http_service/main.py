@@ -238,6 +238,63 @@ async def add_memory(request: AddMemoryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# NOTE: static /memory/list and /memory routes MUST be declared before the
+# parameterized /memory/{memory_id} route, otherwise FastAPI matches "list" as a
+# memory_id and returns 404 "Memory list not found". (route-ordering fix)
+@app.get("/memory/list", response_model=dict, tags=["Memory"])
+async def list_memories(limit: int = 100, offset: int = 0):
+    """List all memories with pagination."""
+    if not memory_system:
+        raise HTTPException(status_code=503, detail="Memory system not initialized")
+
+    try:
+        all_memories = list(memory_system.memories.keys())[offset : offset + limit]
+        return {
+            "ids": all_memories,
+            "total": len(memory_system.memories),
+            "limit": limit,
+            "offset": offset,
+        }
+    except Exception as e:
+        logger.error(f"Error listing memories: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/memory", tags=["Memory"])
+async def list_memories_compat(limit: int = 100, offset: int = 0):
+    """List memories with pagination — service.py-compatible shape.
+
+    Shell consumers (amem-cleanup.sh weekly hygiene job) call GET /memory?limit=N
+    and expect {memories: [{id, content, ...}], total, limit, offset}. Keep this
+    alias byte-compatible with the legacy service.py response.
+    """
+    if not memory_system:
+        raise HTTPException(status_code=503, detail="Memory system not initialized")
+
+    memory_ids = list(memory_system.memories.keys())
+    total = len(memory_ids)
+    memories = []
+    for mid in memory_ids[offset : offset + limit]:
+        note = memory_system.memories.get(mid)
+        if not note:
+            continue
+        memories.append(
+            {
+                "id": note.id,
+                "content": note.content,
+                "keywords": note.keywords,
+                "context": note.context,
+                "category": note.category,
+                "tags": note.tags,
+                "timestamp": note.timestamp,
+                "last_accessed": note.last_accessed,
+                "retrieval_count": note.retrieval_count,
+                "links": note.links if isinstance(note.links, list) else [],
+            }
+        )
+    return {"memories": memories, "total": total, "limit": limit, "offset": offset}
+
+
 @app.get("/memory/{memory_id}", response_model=MemoryResponse, tags=["Memory"])
 async def get_memory(memory_id: str):
     """Get a memory by ID."""
@@ -441,60 +498,6 @@ async def search_memories_hybrid(request: SearchRequest):
     except Exception as e:
         logger.error(f"Error in hybrid search: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/memory/list", response_model=dict, tags=["Memory"])
-async def list_memories(limit: int = 100, offset: int = 0):
-    """List all memories with pagination."""
-    if not memory_system:
-        raise HTTPException(status_code=503, detail="Memory system not initialized")
-
-    try:
-        all_memories = list(memory_system.memories.keys())[offset : offset + limit]
-        return {
-            "ids": all_memories,
-            "total": len(memory_system.memories),
-            "limit": limit,
-            "offset": offset,
-        }
-    except Exception as e:
-        logger.error(f"Error listing memories: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/memory", tags=["Memory"])
-async def list_memories_compat(limit: int = 100, offset: int = 0):
-    """List memories with pagination — service.py-compatible shape.
-
-    Shell consumers (amem-cleanup.sh weekly hygiene job) call GET /memory?limit=N
-    and expect {memories: [{id, content, ...}], total, limit, offset}. Keep this
-    alias byte-compatible with the legacy service.py response.
-    """
-    if not memory_system:
-        raise HTTPException(status_code=503, detail="Memory system not initialized")
-
-    memory_ids = list(memory_system.memories.keys())
-    total = len(memory_ids)
-    memories = []
-    for mid in memory_ids[offset : offset + limit]:
-        note = memory_system.memories.get(mid)
-        if not note:
-            continue
-        memories.append(
-            {
-                "id": note.id,
-                "content": note.content,
-                "keywords": note.keywords,
-                "context": note.context,
-                "category": note.category,
-                "tags": note.tags,
-                "timestamp": note.timestamp,
-                "last_accessed": note.last_accessed,
-                "retrieval_count": note.retrieval_count,
-                "links": note.links if isinstance(note.links, list) else [],
-            }
-        )
-    return {"memories": memories, "total": total, "limit": limit, "offset": offset}
 
 
 if __name__ == "__main__":
