@@ -372,17 +372,37 @@ class AgenticMemorySystem:
             print(f"Error analyzing content: {e}")
             return {"keywords": [], "context": "General", "tags": []}
 
+    # Constructor params MemoryNote actually accepts. Anything else the caller
+    # passes (e.g. the HTTP layer's `metadata`, `file_path`, `language`, …) is
+    # extra metadata to persist, NOT a MemoryNote field — folding it in here
+    # keeps add_note tolerant of richer callers instead of raising
+    # "__init__() got an unexpected keyword argument".
+    _NOTE_PARAMS = {
+        "id", "keywords", "links", "retrieval_count", "timestamp",
+        "last_accessed", "context", "evolution_history", "category", "tags",
+    }
+
     def add_note(self, content: str, time: str = None, **kwargs) -> str:
         """Add a new memory note"""
         # Create MemoryNote without llm_controller
         if time is not None:
             kwargs['timestamp'] = time
-        note = MemoryNote(content=content, **kwargs)
-        
+
+        # Split caller kwargs: known MemoryNote params vs. extra metadata.
+        note_kwargs = {k: v for k, v in kwargs.items() if k in self._NOTE_PARAMS}
+        extra_meta = {k: v for k, v in kwargs.items() if k not in self._NOTE_PARAMS}
+        # A nested `metadata` dict is flattened into top-level extras (Chroma
+        # stores scalars; the retriever json-encodes any dict/list values).
+        nested = extra_meta.pop("metadata", None)
+        if isinstance(nested, dict):
+            extra_meta.update(nested)
+
+        note = MemoryNote(content=content, **note_kwargs)
+
         # Update retriever with all documents
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
-        
+
         # Add to ChromaDB with complete metadata
         metadata = {
             "id": note.id,
@@ -397,6 +417,11 @@ class AgenticMemorySystem:
             "category": note.category,
             "tags": note.tags
         }
+        # Persist caller-supplied extras (related_to link, code context, etc.)
+        # so they remain searchable via the metadata-filtered search endpoint.
+        for k, v in extra_meta.items():
+            if v is not None and k not in metadata:
+                metadata[k] = v
         self.retriever.add_document(note.content, metadata, note.id)
         self._bm25.add_document(note.id, note.content, {})
 
