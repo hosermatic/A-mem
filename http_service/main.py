@@ -109,7 +109,7 @@ class HealthResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - initialize and cleanup."""
-    global memory_system
+    global memory_system, bm25_retriever
 
     # Initialize the memory system
     try:
@@ -117,12 +117,18 @@ async def lifespan(app: FastAPI):
         from agentic_memory.retrievers import BM25Retriever
 
         llm_backend = os.getenv("LLM_BACKEND", "litellm")
+        # Storage settings match service.py, which this app replaced; without them a
+        # custom PERSIST_DIRECTORY/MEMORY_NAMESPACE silently opened the default store.
         memory_system = AgenticMemorySystem(
             model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
             llm_backend=llm_backend,
             llm_model=os.getenv("LLM_MODEL", "memory-evolution"),
+            evo_threshold=int(os.getenv("EVO_THRESHOLD", "100")),
             llm_base_url=os.getenv("LITELLM_GATEWAY_URL", "http://localhost:4001") if llm_backend == "litellm" else None,
             api_key=os.getenv("LITELLM_API_KEY") or os.getenv("OPENAI_API_KEY"),
+            persistent=os.getenv("PERSISTENT", "true").lower() == "true",
+            persist_directory=os.getenv("PERSIST_DIRECTORY", os.path.expanduser("~/.agentic_memory")),
+            namespace=os.getenv("MEMORY_NAMESPACE", "default"),
         )
 
         # Build BM25 index from existing memories
